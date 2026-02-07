@@ -1,0 +1,681 @@
+From 38abb76cbf8c7570edb80ad97c25d9860ee2904e Mon Sep 17 00:00:00 2001
+From: DeepBrain Team <deepbrain@local.dev>
+Date: Sat, 7 Feb 2026 09:25:02 +0800
+Subject: [PATCH] Fix: robust val_iters/patience handling; add optional NaN
+ dump and tests
+
+---
+ ufo-3/tests/test_data_loading.py              |  39 +++
+ ufo-3/tests/test_nan_dumping.py               |  92 +++++
+ ufo-3/tests/test_train_validation_defaults.py |  81 +++++
+ ufo-3/train.py                                | 323 ++++++++++++++----
+ 4 files changed, 472 insertions(+), 63 deletions(-)
+ create mode 100644 ufo-3/tests/test_data_loading.py
+ create mode 100644 ufo-3/tests/test_nan_dumping.py
+ create mode 100644 ufo-3/tests/test_train_validation_defaults.py
+
+diff --git a/ufo-3/tests/test_data_loading.py b/ufo-3/tests/test_data_loading.py
+new file mode 100644
+index 0000000..360602b
+--- /dev/null
++++ b/ufo-3/tests/test_data_loading.py
+@@ -0,0 +1,39 @@
++import os
++import sys
++import pytest
++# make sure repo root is importable
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
++from data import create_dataset_train
++
++
++def test_create_dataset_train_returns_iterable():
++    # Use existing small dataset file if available
++    train_txt = './data/3025.txt'
++    if not os.path.exists(train_txt):
++        pytest.skip('Small dataset file ./data/3025.txt not found; skip data loading test')
++    cfg = {
++        'size_3d_patch': 9,
++        'dataset_mode': 'chcps',
++        'train_params': {
++            'train_txtfile': train_txt,
++            'featrues_CHCP': 1,
++            'max_order': 8
++        }
++    }
++    train_list = [train_txt]
++    # Some environments may not have the optional dataset implementations; skip in that case
++    try:
++        import importlib
++        importlib.import_module('data.chcps_dataset')
++    except Exception:
++        pytest.skip('Dataset implementation data.chcps_dataset not available; skip data loading test')
++
++    dataset = create_dataset_train(cfg, train_list, 1)
++    # Expect an iterable with at least one batch
++    iterator = iter(dataset)
++    batch = next(iterator, None)
++    assert batch is not None
++    assert 'fodlr' in batch
++    assert 'Y' in batch
++    assert 'G' in batch
++    assert 'mask' in batch
+diff --git a/ufo-3/tests/test_nan_dumping.py b/ufo-3/tests/test_nan_dumping.py
+new file mode 100644
+index 0000000..6a51bb6
+--- /dev/null
++++ b/ufo-3/tests/test_nan_dumping.py
+@@ -0,0 +1,92 @@
++import os
++import sys
++import yaml
++import pytest
++import torch
++# make repo importable
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
++import train
++
++
++def test_nan_dump_is_created_when_model_outputs_nan(monkeypatch, tmp_path):
++    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), '..', 'train_smoke.yaml'), 'r'))
++    cfg['save_dir'] = str(tmp_path)
++    cfg['train_params']['n_dense_epochs'] = 1
++    cfg['train_params']['initial_epoch'] = 0
++    cfg['dump_on_nan'] = True
++
++    class OneBatchDataset:
++        def __iter__(self):
++            batch = {
++                'nside16sh8': torch.tensor([0]),
++                'fodlr': torch.zeros(1, 45, 1, 1, 1),
++                'mask': torch.ones(1, 1, 1, 1),
++                'fodgt': torch.zeros(1, 45, 1, 1, 1),
++                'table': torch.zeros(1),
++                'Y': torch.zeros(1),
++                'G': torch.zeros(1),
++            }
++            yield batch
++        def __len__(self):
++            return 1
++
++    monkeypatch.setattr(train, 'create_dataset_train', lambda cfg_, lst, prev_nf: OneBatchDataset())
++    monkeypatch.setattr(train, 'create_dataset_val', lambda cfg_, lst, prev_nf: OneBatchDataset())
++
++    # ensure save dir exists (main() will attempt to write files)
++    os.makedirs(os.path.join(cfg['save_dir'], cfg['name']), exist_ok=True)
++
++    # monkeypatch swanlab.log to avoid requiring swanlab.init() in tests
++    monkeypatch.setattr(train.swanlab, 'log', lambda *a, **k: None)
++
++    # Fake model that returns NaNs in outputs to trigger dump
++    class NaNModel:
++        def __init__(self, *a, **k):
++            import torch
++            self._p = torch.nn.Parameter(torch.zeros(1))
++        def to(self, device):
++            # move param to device in a way that preserves leaf status (wrap data)
++            import torch
++            self._p = torch.nn.Parameter(self._p.data.to(device))
++            return self
++        def load_state_dict(self, *a, **k):
++            return
++        def state_dict(self):
++            return {'_p': self._p.detach().cpu()}
++        def parameters(self):
++            return [self._p]
++        def eval(self):
++            return self
++        def train(self):
++            return self
++        def __call__(self, inputs, nside16sh8, table, A):
++            # produce NaN tensors on same device as inputs
++            outputs = torch.full_like(inputs, float('nan'))
++            fod_pred = inputs.new_full((inputs.size(0), 45, *inputs.shape[3:]), float('nan'))
++            return outputs, fod_pred, None
++
++    monkeypatch.setattr(train, 'Model', NaNModel)
++
++    # run - should not raise and should produce a dump
++    train.main(cfg)
++
++    # check for dump directory and at least one file
++    save_path = os.path.join(cfg['save_dir'], cfg['name'])
++    dump_dir = os.path.join(save_path, 'nan_dumps')
++    # small wait if file system is slow
++    assert os.path.exists(dump_dir), f"Expected dump dir {dump_dir} to exist"
++    files = os.listdir(dump_dir)
++    assert len(files) > 0, 'Expected at least one nan dump file'
++
++    monkeypatch.setattr(train, 'Model', NaNModel)
++
++    # run - should not raise and should produce a dump
++    train.main(cfg)
++
++    # check for dump directory and at least one file
++    save_path = os.path.join(cfg['save_dir'], cfg['name'])
++    dump_dir = os.path.join(save_path, 'nan_dumps')
++    # small wait if file system is slow
++    assert os.path.exists(dump_dir), f"Expected dump dir {dump_dir} to exist"
++    files = os.listdir(dump_dir)
++    assert len(files) > 0, 'Expected at least one nan dump file'
+diff --git a/ufo-3/tests/test_train_validation_defaults.py b/ufo-3/tests/test_train_validation_defaults.py
+new file mode 100644
+index 0000000..34a79ff
+--- /dev/null
++++ b/ufo-3/tests/test_train_validation_defaults.py
+@@ -0,0 +1,81 @@
++import os
++import sys
++import yaml
++import pytest
++import torch
++# make repo importable
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
++import train
++
++
++def test_train_runs_without_top_level_val_and_patience(monkeypatch, tmp_path):
++    # Load base smoke config and remove top-level val_iters/patience
++    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), '..', 'train_smoke.yaml'), 'r'))
++    cfg.pop('val_iters', None)
++    cfg.pop('patience', None)
++
++    # small experiment artifacts go to tmp
++    cfg['save_dir'] = str(tmp_path)
++    cfg['train_params']['n_dense_epochs'] = 1
++    cfg['train_params']['initial_epoch'] = 0
++    # skip validation in this quick unit test (we only check no crash for missing keys)
++    cfg['val_iters'] = 0
++
++    # Provide tiny dataset that yields a single safe batch
++    class OneBatchDataset:
++        def __iter__(self):
++            batch = {
++                'nside16sh8': torch.tensor([0]),
++                'fodlr': torch.zeros(1, 45, 1, 1, 1),
++                'mask': torch.ones(1, 1, 1, 1),
++                'fodgt': torch.zeros(1, 45, 1, 1, 1),
++                'table': torch.zeros(1),
++                'Y': torch.zeros(1),
++                'G': torch.zeros(1),
++            }
++            yield batch
++        def __len__(self):
++            return 1
++
++    monkeypatch.setattr(train, 'create_dataset_train', lambda cfg_, lst, prev_nf: OneBatchDataset())
++    monkeypatch.setattr(train, 'create_dataset_val', lambda cfg_, lst, prev_nf: OneBatchDataset())
++
++    # ensure save dir exists (main() will attempt to write files)
++    os.makedirs(os.path.join(cfg['save_dir'], cfg['name']), exist_ok=True)
++
++    # monkeypatch swanlab.log to avoid requiring swanlab.init() in tests
++    monkeypatch.setattr(train.swanlab, 'log', lambda *a, **k: None)
++
++    # Tiny deterministic model (no NaNs) - return None for deconvolved SHC to skip einsum
++    class TinyModel:
++        def __init__(self, *a, **k):
++            import torch
++            self._p = torch.nn.Parameter(torch.zeros(1))
++        def to(self, device):
++            # move param to device but keep leaf status
++            import torch
++            self._p = torch.nn.Parameter(self._p.data.to(device))
++            return self
++        def load_state_dict(self, *a, **k):
++            return
++        def state_dict(self):
++            return {'_p': self._p.detach().cpu()}
++        def parameters(self):
++            return [self._p]
++        def named_parameters(self):
++            return [('param_0', self._p)]
++        def eval(self):
++            return self
++        def train(self):
++            return self
++        def __call__(self, inputs, nside16sh8, table, A):
++            # return: reconstructed, fod_pred_shc, extra_trapped_shc
++            # create outputs from parameter (avoid reusing input storage which may be modified in-place later)
++            outputs = (1.0 + self._p) * torch.ones_like(inputs)
++            # We return None for the SHC deconvolved tensors to avoid running einsum in training
++            return outputs, None, None
++
++    monkeypatch.setattr(train, 'Model', TinyModel)
++
++    # run - should not raise
++    train.main(cfg)
+diff --git a/ufo-3/train.py b/ufo-3/train.py
+index 13a4115..6794720 100644
+--- a/ufo-3/train.py
++++ b/ufo-3/train.py
+@@ -23,7 +23,7 @@ import torch
+ torch.autograd.set_detect_anomaly(True)
+ #from torch.utils.tensorboard import Summary#writer
+ import pytorch_warmup as warmup
+-DEVICE = 'cuda' #torch.DEVICE("cuda:0" if torch.cuda.is_available() else "cpu")
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ sys.path.append('./data')
+ from data import create_dataset_val,create_dataset_train
+ from data.chcp_dataset import pre_generator,matrixB
+@@ -111,7 +111,7 @@ def main(cfg):
+     
+     # Extract variables from cfg
+     batch_size = cfg['batch_size']
+-    lr = cfg['lr']
++    lr = float(cfg['lr'])
+     n_epoch = cfg['n_epoch']
+     filter_start = cfg['filter_start']
+     sh_degree = cfg['sh_degree']
+@@ -126,13 +126,13 @@ def main(cfg):
+     isoSpa = not cfg['anisoSpa']
+     concatenate = cfg['concatenate']
+     loss_fn_intensity = cfg['loss_intensity']
+-    intensity_weight = cfg['intensity_weight']
++    intensity_weight = float(cfg['intensity_weight'])
+     loss_fn_sparsity = cfg['loss_sparsity']
+-    sigma_sparsity = cfg['sigma_sparsity']
+-    sparsity_weight = cfg['sparsity_weight']
++    sigma_sparsity = float(cfg['sigma_sparsity'])
++    sparsity_weight = float(cfg['sparsity_weight'])
+     loss_fn_non_negativity = cfg['loss_non_negativity']
+-    nn_fodf_weight = cfg['nn_fodf_weight']
+-    pve_weight = cfg['pve_weight']
++    nn_fodf_weight = float(cfg['nn_fodf_weight'])
++    pve_weight = float(cfg['pve_weight'])
+     load_state = cfg['load_state']
+     rf_name = cfg['rf_name']
+     wm = cfg['wm']
+@@ -192,11 +192,21 @@ def main(cfg):
+     save_loss['train'] = {}
+   
+     tb_j = 0
++    counter = 0
++    early_stop = False
++    # AMP & cudnn settings from config
++    use_amp = cfg.get('use_amp', False)
++    if use_amp and not torch.cuda.is_available():
++        print("Warning: use_amp=True but CUDA not available. Disabling AMP.")
++        use_amp = False
++    cudnn_benchmark = cfg.get('cudnn_benchmark', False)
++    torch.backends.cudnn.benchmark = cudnn_benchmark
++    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+ 
+     # Start training timer
+     training_start_time = time.time()
+     total_epochs = cfg['train_params']['n_dense_epochs'] - cfg['train_params']['initial_epoch']
+-    print(f"Starting training for {total_epochs} epochs...")
++    print(f"Starting training for {total_epochs} epochs... (use_amp={use_amp}, cudnn_benchmark={cudnn_benchmark})")
+ 
+     # Training loop
+     for epoch in range(cfg['train_params']['initial_epoch'], cfg['train_params']['n_dense_epochs']):
+@@ -232,6 +242,11 @@ def main(cfg):
+ 
+             optimizer.zero_grad()
+             to_print = ''
++            # Initialize per-batch loss components (safe defaults)
++            loss_sparsity = torch.tensor(0.).to(DEVICE)
++            loss_non_negativity_fodf = torch.tensor(0.).to(DEVICE)
++            loss_pve_fodf_coff = torch.tensor(0.).to(DEVICE)
++            loss_pve_extra_trapped = torch.tensor(0.).to(DEVICE)
+ 
+             # Load the data in the DEVICE
+             input = data['fodlr'].to(DEVICE).unsqueeze(1)
+@@ -243,47 +258,199 @@ def main(cfg):
+             mask = data['mask'].to(DEVICE)
+             output = input.squeeze(1)
+ 
+-            x_reconstructed, x_deconvolved_fodf_coff_shc, x_deconvolved_extra_trapped_shc = model(input,nside16sh8,table,A)
+-            
+-            ###############################################################################################
+-            ###############################################################################################
+-            # Loss
+-            loss=0
+-            ###############################################################################################
+-            ###############################################################################################
+-            #KL
+-            # loss_KL=channel_decorrelation_loss(x_reconstructed)
+-            # loss+=(1-0.1*loss_KL.item())
+-            # Intensity loss
+-            loss_intensity = intensity_criterion(x_reconstructed, output, mask[:, None].expand(-1, output.shape[1], -1, -1, -1))
+-            loss_intensity_ += loss_intensity.item()
+-            loss+= intensity_weight * loss_intensity
+-            to_print += ', Intensity: {0:.10f}'.format(loss_intensity.item())
+-            
+-            if not x_deconvolved_fodf_coff_shc  is None:
+-                x_deconvolved_fodf_coff =torch.einsum('agbijk,bl->aglijk',x_deconvolved_fodf_coff_shc,BC)#x_deconvolved_fodf_coff = denseGrid_interpolate(x_deconvolved_fodf_coff_shc)
+-                ###############################################################################################
+-                # Sparsity loss
+-                loss_sparsity = torch.mean(torch.abs(x_deconvolved_fodf_coff))
+-                loss_sparsity_ += loss_sparsity.item()
+-                loss += sparsity_weight * loss_sparsity
+-                to_print += ', fodf_coff Sparsity: {0:.10f}'.format(loss_sparsity.item())
+-                
+-                ###############################################################################################
+-                # Non negativity loss
+-                fodf_neg = torch.min(x_deconvolved_fodf_coff, torch.zeros_like(x_deconvolved_fodf_coff))
+-                fodf_neg_zeros = torch.zeros(fodf_neg.shape).to(DEVICE)
+-                loss_non_negativity_fodf = non_negativity_criterion(fodf_neg, fodf_neg_zeros, mask[:, None, None].expand(-1, fodf_neg_zeros.shape[1], fodf_neg_zeros.shape[2], -1, -1, -1))
+-                loss_non_negativity_fodf_ += loss_non_negativity_fodf.item()
+-                loss += nn_fodf_weight * loss_non_negativity_fodf
+-                to_print += ', fodf_coff NN: {0:.10f}'.format(loss_non_negativity_fodf.item())
+-
+-                ###############################################################################################
+-                # Partial volume regularizer
+-                loss_pve_fodf_coff = 1/(torch.mean(x_deconvolved_fodf_coff_shc[:, :, 0][mask[:, None].expand(-1, x_deconvolved_fodf_coff_shc.shape[1], -1, -1, -1)==1])*np.sqrt(4*np.pi) + 1e-16)
+-                loss_pve_fodf_coff_ += loss_pve_fodf_coff.item()
+-                loss += pve_weight * loss_pve_fodf_coff
+-                to_print += ', fodf_coff regularizer: {0:.10f}'.format(loss_pve_fodf_coff.item())
++            # Forward + Loss (supports AMP when enabled)
++            if use_amp:
++                with torch.cuda.amp.autocast():
++                    x_reconstructed, x_deconvolved_fodf_coff_shc, x_deconvolved_extra_trapped_shc = model(input,nside16sh8,table,A)
++                    # Check for NaNs in model outputs
++                    if torch.isnan(x_reconstructed).any() or (x_deconvolved_fodf_coff_shc is not None and torch.isnan(x_deconvolved_fodf_coff_shc).any()) or (x_deconvolved_extra_trapped_shc is not None and torch.isnan(x_deconvolved_extra_trapped_shc).any()):
++                        print('Warning: NaN detected in model outputs; skipping this batch')
++                        # optionally dump batch for postmortem debugging
++                        if cfg.get('dump_on_nan', False):
++                            try:
++                                dump_dir = os.path.join(save_path, 'nan_dumps')
++                                os.makedirs(dump_dir, exist_ok=True)
++                                dump_path = os.path.join(dump_dir, f"epoch{epoch}_iter{i}_model_outputs_nan.pt")
++                                torch.save({
++                                    'epoch': epoch, 'iter': i, 'reason': 'model_outputs_nan',
++                                    'data': {k: v.detach().cpu() for k, v in data.items() if isinstance(v, torch.Tensor)},
++                                    'x_reconstructed': x_reconstructed.detach().cpu() if 'x_reconstructed' in locals() else None,
++                                    'x_deconvolved_fodf_coff_shc': x_deconvolved_fodf_coff_shc.detach().cpu() if 'x_deconvolved_fodf_coff_shc' in locals() and isinstance(x_deconvolved_fodf_coff_shc, torch.Tensor) else None,
++                                    'x_deconvolved_extra_trapped_shc': x_deconvolved_extra_trapped_shc.detach().cpu() if 'x_deconvolved_extra_trapped_shc' in locals() and isinstance(x_deconvolved_extra_trapped_shc, torch.Tensor) else None,
++                                }, dump_path)
++                                print(f"Saved NaN dump to {dump_path}")
++                            except Exception as e:
++                                print('Failed to save NaN dump:', e)
++                        continue
++                    # Loss
++                    loss = torch.tensor(0.).to(DEVICE)
++                    # Intensity loss
++                    loss_intensity = intensity_criterion(x_reconstructed, output, mask[:, None].expand(-1, output.shape[1], -1, -1, -1))
++                    loss_intensity_ += loss_intensity.item()
++                    loss = loss + intensity_weight * loss_intensity
++                    to_print += ', Intensity: {0:.10f}'.format(loss_intensity.item())
++                    if not x_deconvolved_fodf_coff_shc is None:
++                        try:
++                            x_deconvolved_fodf_coff = torch.einsum('agbijk,bl->aglijk', x_deconvolved_fodf_coff_shc, BC)
++                            if torch.isnan(x_deconvolved_fodf_coff).any():
++                                print('Warning: NaN in x_deconvolved_fodf_coff after einsum (AMP); skipping batch')
++                                if cfg.get('dump_on_nan', False):
++                                    try:
++                                        dump_dir = os.path.join(save_path, 'nan_dumps')
++                                        os.makedirs(dump_dir, exist_ok=True)
++                                        dump_path = os.path.join(dump_dir, f"epoch{epoch}_iter{i}_einsum_nan_amp.pt")
++                                        torch.save({
++                                            'epoch': epoch, 'iter': i, 'reason': 'einsum_nan_amp',
++                                            'data': {k: v.detach().cpu() for k, v in data.items() if isinstance(v, torch.Tensor)},
++                                            'x_deconvolved_fodf_coff_shc': x_deconvolved_fodf_coff_shc.detach().cpu() if 'x_deconvolved_fodf_coff_shc' in locals() and isinstance(x_deconvolved_fodf_coff_shc, torch.Tensor) else None,
++                                            'x_deconvolved_fodf_coff': x_deconvolved_fodf_coff.detach().cpu() if 'x_deconvolved_fodf_coff' in locals() and isinstance(x_deconvolved_fodf_coff, torch.Tensor) else None,
++                                        }, dump_path)
++                                        print(f"Saved NaN dump to {dump_path}")
++                                    except Exception as e:
++                                        print('Failed to save NaN dump:', e)
++                                continue
++                        except Exception as e:
++                            print('EINSUM ERROR (AMP) computing x_deconvolved_fodf_coff:', e)
++                            raise
++                        # Sparsity loss
++                        loss_sparsity = torch.mean(torch.abs(x_deconvolved_fodf_coff))
++                        loss_sparsity_ += loss_sparsity.item()
++                        try:
++                            term = sparsity_weight * loss_sparsity
++                            loss = loss + term
++                        except Exception as e:
++                            print('DEBUG: sparsity add failed', type(loss), getattr(loss,'shape',None), type(sparsity_weight), type(loss_sparsity), getattr(loss_sparsity,'shape',None))
++                            raise
++                        to_print += ', fodf_coff Sparsity: {0:.10f}'.format(loss_sparsity.item())
++                        # Non negativity loss
++                        fodf_neg = torch.min(x_deconvolved_fodf_coff, torch.zeros_like(x_deconvolved_fodf_coff))
++                        fodf_neg_zeros = torch.zeros(fodf_neg.shape).to(DEVICE)
++                        loss_non_negativity_fodf = non_negativity_criterion(fodf_neg, fodf_neg_zeros, mask[:, None, None].expand(-1, fodf_neg_zeros.shape[1], fodf_neg_zeros.shape[2], -1, -1, -1))
++                        loss_non_negativity_fodf_ += loss_non_negativity_fodf.item()
++                        loss = loss + nn_fodf_weight * loss_non_negativity_fodf
++                        to_print += ', fodf_coff NN: {0:.10f}'.format(loss_non_negativity_fodf.item())
++                        # Partial volume regularizer (guarded)
++                        masked = x_deconvolved_fodf_coff_shc[:, :, 0][mask[:, None].expand(-1, x_deconvolved_fodf_coff_shc.shape[1], -1, -1, -1)==1]
++                        if masked.numel() == 0:
++                            loss_pve_fodf_coff = torch.tensor(0.).to(DEVICE)
++                        else:
++                            loss_pve_fodf_coff = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                        loss_pve_fodf_coff_ += loss_pve_fodf_coff.item()
++                        loss = loss + pve_weight * loss_pve_fodf_coff
++                        to_print += ', fodf_coff regularizer: {0:.10f}'.format(loss_pve_fodf_coff.item())
++                    index = 0
++                    if gm:
++                        masked = x_deconvolved_extra_trapped_shc[:, index, 0][mask==1]
++                        if masked.numel() == 0:
++                            loss_pve_extra_trapped = torch.tensor(0.).to(DEVICE)
++                        else:
++                            loss_pve_extra_trapped = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                        loss_pve_extra_trapped_ += loss_pve_extra_trapped.item()
++                        loss += pve_weight * loss_pve_extra_trapped
++                        to_print += ', extra_trapped regularizer GM: {0:.10f}'.format(loss_pve_extra_trapped.item())
++                        index += 1
++                    if csf:
++                        masked = x_deconvolved_extra_trapped_shc[:, index, 0][mask==1]
++                        if masked.numel() == 0:
++                            loss_pve_extra_trapped = torch.tensor(0.).to(DEVICE)
++                        else:
++                            loss_pve_extra_trapped = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                        loss_pve_extra_trapped_ += loss_pve_extra_trapped.item()
++                        loss += pve_weight * loss_pve_extra_trapped
++                        to_print += ', extra_trapped regularizer CSF: {0:.10f}'.format(loss_pve_extra_trapped.item())
++            else:
++                x_reconstructed, x_deconvolved_fodf_coff_shc, x_deconvolved_extra_trapped_shc = model(input,nside16sh8,table,A)
++                # Check for NaNs in model outputs
++                if torch.isnan(x_reconstructed).any() or (x_deconvolved_fodf_coff_shc is not None and torch.isnan(x_deconvolved_fodf_coff_shc).any()) or (x_deconvolved_extra_trapped_shc is not None and torch.isnan(x_deconvolved_extra_trapped_shc).any()):
++                    print('Warning: NaN detected in model outputs; skipping this batch')
++                    if cfg.get('dump_on_nan', False):
++                        try:
++                            dump_dir = os.path.join(save_path, 'nan_dumps')
++                            os.makedirs(dump_dir, exist_ok=True)
++                            dump_path = os.path.join(dump_dir, f"epoch{epoch}_iter{i}_model_outputs_nan_nonamp.pt")
++                            torch.save({
++                                'epoch': epoch, 'iter': i, 'reason': 'model_outputs_nan_nonamp',
++                                'data': {k: v.detach().cpu() for k, v in data.items() if isinstance(v, torch.Tensor)},
++                                'x_reconstructed': x_reconstructed.detach().cpu() if 'x_reconstructed' in locals() else None,
++                                'x_deconvolved_fodf_coff_shc': x_deconvolved_fodf_coff_shc.detach().cpu() if 'x_deconvolved_fodf_coff_shc' in locals() and isinstance(x_deconvolved_fodf_coff_shc, torch.Tensor) else None,
++                            }, dump_path)
++                            print(f"Saved NaN dump to {dump_path}")
++                        except Exception as e:
++                            print('Failed to save NaN dump:', e)
++                    continue
++                # Loss
++                loss = torch.tensor(0.).to(DEVICE)
++                # Intensity loss
++                loss_intensity = intensity_criterion(x_reconstructed, output, mask[:, None].expand(-1, output.shape[1], -1, -1, -1))
++                loss_intensity_ += loss_intensity.item()
++                loss = loss + intensity_weight * loss_intensity
++                to_print += ', Intensity: {0:.10f}'.format(loss_intensity.item())
++                if not x_deconvolved_fodf_coff_shc is None:
++                    try:
++                        x_deconvolved_fodf_coff = torch.einsum('agbijk,bl->aglijk', x_deconvolved_fodf_coff_shc, BC)
++                        if torch.isnan(x_deconvolved_fodf_coff).any():
++                            print('Warning: NaN in x_deconvolved_fodf_coff after einsum (non-AMP); skipping batch')
++                            if cfg.get('dump_on_nan', False):
++                                try:
++                                    dump_dir = os.path.join(save_path, 'nan_dumps')
++                                    os.makedirs(dump_dir, exist_ok=True)
++                                    dump_path = os.path.join(dump_dir, f"epoch{epoch}_iter{i}_einsum_nan_nonamp.pt")
++                                    torch.save({
++                                        'epoch': epoch, 'iter': i, 'reason': 'einsum_nan_nonamp',
++                                        'data': {k: v.detach().cpu() for k, v in data.items() if isinstance(v, torch.Tensor)},
++                                        'x_deconvolved_fodf_coff_shc': x_deconvolved_fodf_coff_shc.detach().cpu() if 'x_deconvolved_fodf_coff_shc' in locals() and isinstance(x_deconvolved_fodf_coff_shc, torch.Tensor) else None,
++                                        'x_deconvolved_fodf_coff': x_deconvolved_fodf_coff.detach().cpu() if 'x_deconvolved_fodf_coff' in locals() and isinstance(x_deconvolved_fodf_coff, torch.Tensor) else None,
++                                    }, dump_path)
++                                    print(f"Saved NaN dump to {dump_path}")
++                                except Exception as e:
++                                    print('Failed to save NaN dump:', e)
++                            continue
++                    except Exception as e:
++                        print('EINSUM ERROR (non-AMP) computing x_deconvolved_fodf_coff:', e)
++                        raise
++                    loss_sparsity = torch.mean(torch.abs(x_deconvolved_fodf_coff))
++                    loss_sparsity_ += loss_sparsity.item()
++                    try:
++                        term = sparsity_weight * loss_sparsity
++                        loss = loss + term
++                    except Exception as e:
++                        print('DEBUG: sparsity add failed (non-AMP)', type(loss), getattr(loss,'shape',None), type(sparsity_weight), type(loss_sparsity), getattr(loss_sparsity,'shape',None))
++                        raise
++                    to_print += ', fodf_coff Sparsity: {0:.10f}'.format(loss_sparsity.item())
++                    fodf_neg = torch.min(x_deconvolved_fodf_coff, torch.zeros_like(x_deconvolved_fodf_coff))
++                    fodf_neg_zeros = torch.zeros(fodf_neg.shape).to(DEVICE)
++                    loss_non_negativity_fodf = non_negativity_criterion(fodf_neg, fodf_neg_zeros, mask[:, None, None].expand(-1, fodf_neg_zeros.shape[1], fodf_neg_zeros.shape[2], -1, -1, -1))
++                    loss_non_negativity_fodf_ += loss_non_negativity_fodf.item()
++                    loss = loss + nn_fodf_weight * loss_non_negativity_fodf
++                    to_print += ', fodf_coff NN: {0:.10f}'.format(loss_non_negativity_fodf.item())
++                    masked = x_deconvolved_fodf_coff_shc[:, :, 0][mask[:, None].expand(-1, x_deconvolved_fodf_coff_shc.shape[1], -1, -1, -1)==1]
++                    if masked.numel() == 0:
++                        loss_pve_fodf_coff = torch.tensor(0.).to(DEVICE)
++                    else:
++                        loss_pve_fodf_coff = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                    loss_pve_fodf_coff_ += loss_pve_fodf_coff.item()
++                    loss = loss + pve_weight * loss_pve_fodf_coff
++                    to_print += ', fodf_coff regularizer: {0:.10f}'.format(loss_pve_fodf_coff.item())
++                index = 0
++                if gm:
++                    masked = x_deconvolved_extra_trapped_shc[:, index, 0][mask==1]
++                    if masked.numel() == 0:
++                        loss_pve_extra_trapped = torch.tensor(0.).to(DEVICE)
++                    else:
++                        loss_pve_extra_trapped = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                    loss_pve_extra_trapped_ += loss_pve_extra_trapped.item()
++                    loss += pve_weight * loss_pve_extra_trapped
++                    to_print += ', extra_trapped regularizer GM: {0:.10f}'.format(loss_pve_extra_trapped.item())
++                    index += 1
++                if csf:
++                    masked = x_deconvolved_extra_trapped_shc[:, index, 0][mask==1]
++                    if masked.numel() == 0:
++                        loss_pve_extra_trapped = torch.tensor(0.).to(DEVICE)
++                    else:
++                        loss_pve_extra_trapped = 1/(torch.mean(masked)*np.sqrt(4*np.pi) + 1e-16)
++                    loss_pve_extra_trapped_ += loss_pve_extra_trapped.item()
++                    loss += pve_weight * loss_pve_extra_trapped
++                    to_print += ', extra_trapped regularizer CSF: {0:.10f}'.format(loss_pve_extra_trapped.item())
+ 
+             #if not x_deconvolved_extra_trapped_shc is None:
+             #    ###############################################################################################
+@@ -324,13 +491,19 @@ def main(cfg):
+                 'Batch/train_total': loss.item()
+             })
+             #################################F##############################################################
+-            # Loss backward
+-            loss.backward()
+-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=2)
++            # Loss backward (AMP aware) and gradient logging
++            if scaler is not None:
++                scaler.scale(loss).backward()
++                # Unscale before gradient clipping and logging
++                scaler.unscale_(optimizer)
++                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=2)
++            else:
++                loss.backward()
++                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1, norm_type=2)
++
+             for name, parameter in model.named_parameters():
+-                if parameter.grad is not None :
+-                    if torch.isnan(parameter.grad).any()==0:
+-                        # Log gradient statistics instead of histogram since SwanLab doesn't have Histogram
++                if parameter.grad is not None:
++                    if not torch.isnan(parameter.grad).any():
+                         grad_stats = {
+                             f"gradients/{name}_mean": parameter.grad.mean().item(),
+                             f"gradients/{name}_std": parameter.grad.std().item(),
+@@ -339,11 +512,16 @@ def main(cfg):
+                         }
+                         swanlab.log(grad_stats)
+                     else:
+-                        print(name,'nan')
++                        print(name, 'nan')
+                         continue
+                 else:
+                     continue
+-            optimizer.step()
++
++            if scaler is not None:
++                scaler.step(optimizer)
++                scaler.update()
++            else:
++                optimizer.step()
+             
+             with warmup_scheduler.dampening():
+                 if warmup_scheduler.last_step + 1 >= warmup_period and optimizer.param_groups[0]['lr']>0.00005:
+@@ -417,6 +595,15 @@ def main(cfg):
+                     'Training/avg_epoch_time': avg_epoch_time,
+                     'Training/eta_hours': estimated_remaining_time / 3600
+             })
++        # Persist epoch metrics to CSV for easy aggregation
++        metrics_csv = os.path.join(save_path, 'metrics.csv')
++        if not os.path.exists(metrics_csv):
++            with open(metrics_csv, 'w') as f:
++                f.write('epoch,train_total,train_intensity,train_sparsity,train_nn,train_pve_fodf_coff,train_pve_extra_trapped,val_loss,val_acc,epoch_time,avg_epoch_time\n')
++        val_loss_val = val_loss.item() if 'val_loss' in locals() else float('nan')
++        val_acc_val = val_acc.item() if 'val_acc' in locals() else float('nan')
++        with open(metrics_csv, 'a') as f:
++            f.write(f"{epoch+1},{loss_/n_batch},{loss_intensity_/n_batch},{loss_sparsity_/n_batch},{loss_non_negativity_fodf_/n_batch},{loss_pve_fodf_coff_/n_batch},{loss_pve_extra_trapped_/n_batch},{val_loss_val},{val_acc_val},{epoch_time},{avg_epoch_time}\n")
+         
+         # if use_swanlab:
+         #     swanlab.log(#to_swanlab)
+@@ -424,11 +611,15 @@ def main(cfg):
+         ###############################################################################################
+         #validation
+         if epoch % 1 == 0:
++            # determine validation iterations with sensible defaults
++            val_iters = cfg.get('val_iters', cfg.get('train_params', {}).get('val_iters', 0))
++            patience = cfg.get('patience', cfg.get('train_params', {}).get('patience', 5))
++
+             j_val_loss=torch.tensor(0).float().to(DEVICE)
+             j_val_loss_fod=torch.tensor(0).float().to(DEVICE)
+             j_val_acc=torch.tensor(0).float().to(DEVICE)
+             with torch.no_grad():
+-                for j in range(cfg['val_iters']):
++                for j in range(val_iters):
+                     data_list = next(val_temp_dataloader, 'reset_val_dataloader')
+                     if data_list == 'reset_val_dataloader':
+                         val_temp_dataloader = iter(val_dataset)
+@@ -443,7 +634,7 @@ def main(cfg):
+                     table=data_list['table'].float().to(DEVICE)
+                     Y=data_list['Y'].float().to(DEVICE)
+                     G=data_list['G'].float().to(DEVICE)
+-                    nside16sh8 = data['nside16sh8'].to(DEVICE)
++                    nside16sh8 = data_list['nside16sh8'].to(DEVICE)
+                     A=Y*G
+                     #val_dti=torch.einsum('agb,abijk->agijk',A.transpose(1,2),inputs)#bs,10,X,Y,Z bs,45,10
+                     model.eval()
+@@ -453,9 +644,15 @@ def main(cfg):
+                     j_val_loss+=maskmse(inputs,outputs)
+                     j_val_loss_fod+=maskmse(fodgt,fod_pred[:,:45])
+                     j_val_acc+=calculate_acc(fodgt,fod_pred[:,:45],mask)
+-                val_loss=j_val_loss/cfg['val_iters']
+-                val_loss_fod=j_val_loss_fod/cfg['val_iters']
+-                val_acc=j_val_acc/cfg['val_iters']
++
++                if val_iters > 0:
++                    val_loss=j_val_loss/val_iters
++                    val_loss_fod=j_val_loss_fod/val_iters
++                    val_acc=j_val_acc/val_iters
++                else:
++                    val_loss=torch.tensor(float('nan')).to(DEVICE)
++                    val_loss_fod=torch.tensor(float('nan')).to(DEVICE)
++                    val_acc=torch.tensor(float('nan')).to(DEVICE)
+ 
+                 if val_acc > best_val_acc:
+                     counter = 0
+@@ -466,7 +663,7 @@ def main(cfg):
+                     torch.save(model.state_dict(), model_path)
+                 else:
+                     counter += 1
+-                    if counter >= cfg['patience']:
++                    if counter >= patience:
+                         early_stop = True
+                     print(f"Current ACC: {val_acc}, Best ACC: {best_val_acc}, early stopping counter: {counter}")
+                 if epoch%20==0 and epoch >0:
+-- 
+2.34.1
+

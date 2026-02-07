@@ -1,0 +1,61 @@
+name: short_test
+save_dir: '../experiments'
+shuffle: true
+num_threads: 0
+
+dataset_mode: 'chcp'
+constrain_points: 258
+batch_size: 1
+bs: 1
+lr: 8e-4
+n_epoch: 5
+filter_start: 12
+sh_degree: 8
+kernel_sizeSph: 3
+kernel_sizeSpa: 3
+depth: 2
+n_side: 16
+normalize: True
+size_3d_patch: 9
+graph_sampling: 'healpix'
+conv_name: 'sphconv'
+anisoSpa: False
+concatenate: False
+
+loss_intensity: 'L2'
+intensity_weight: 1.0
+loss_sparsity: 'cauchy'  # use cauchy as in default train.yaml
+sigma_sparsity: 1.0
+sparsity_weight: 1e-3
+loss_non_negativity: 'L1'
+nn_fodf_weight: 1.0
+pve_weight: 0.1
+
+load_state: ''
+rf_name: 'dhollander'
+wm: True
+gm: False
+csf: False
+save_every: 1
+middle_voxel: True
+
+use_amp: true
+cudnn_benchmark: false
+
+optimizer:
+  type: Adam
+  momentum: 0.9
+  weight_decay: 1.0e-4
+  warmup_steps: 50
+  weight_decay_l1: 0
+
+train_params:
+  initial_epoch: 0
+  n_dense_epochs: 3
+  train_txtfile: './data/ismrmgt.txt'
+  val_txtfile: './data/ismrmgt.txt'
+  max_order: 8
+  bs: 1
+  val_iters: 4
+  featrues_CHCP: 1
+  featrues_HCP: 1

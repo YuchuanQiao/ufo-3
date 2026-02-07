@@ -1,0 +1,39 @@
+# Experiment name consistent with training config
+experiment_name: '0224_ismrmbasice4po258'
+data_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2'
+
+# Model path should match the experiment name and available checkpoints
+model_path: '../experiments/0224_ismrmbasice4po258/best.pt'
+
+# Output naming consistent with experiment
+output_name: '0224_ismrmbasice4po258_test_results.nii.gz'
+epoch: 200
+
+# Test properties
+batch_size: 1
+middle_voxel: True
+
+# Output directory for results
+results_dir: '../experiments/0224_ismrmbasice4po258/test_results'
+
+input:
+  position: 0
+  x_start: 40
+  y_start: 40
+  z_start: 40
+  mask_roi: 0
+  ROI_path: '../data/CHCP/3025/ConnectomeAnalysis/MCP_Mask.nii.gz' 
+  dwi_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/dti_B0.nii.gz'
+  fod_path: '../data/CHCP/FOD/3025/3025_GT_CSTR.nii.gz'
+  mask_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/mask.nii.gz'
+  Gradtable_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/table_flipy.npy'
+  Y_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/Y.npy'
+  G_path: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/G.npy'
+  nside16sh8: '../data/ISMRM2015/ISMRM_2015_Tracto_challenge_ground_truth_dwi_v2/side16sh8.npy'
+  obj_path: '/data/sphere5120.obj'
+  ConstraintSet_path: '/data/ConstraintSet.mat'
+
+pred_patch_size:
+  a: 81
+  b: 105
+  c: 81
